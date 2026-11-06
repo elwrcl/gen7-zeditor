@@ -1,0 +1,129 @@
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 718cb75..518dcfd 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -200,6 +200,20 @@ fn distance_from_clip_rect(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds:
+     return distance_from_clip_rect_impl(position, clip_bounds);
+ }
+ 
++// Geometry clipped to the content mask, so masked-out pixels are never rasterized.
++fn clip_bounds_to_mask(bounds: Bounds, mask: Bounds) -> Bounds {
++    let origin = max(bounds.origin, mask.origin);
++    let end = min(bounds.origin + bounds.size, mask.origin + mask.size);
++    return Bounds(origin, max(end - origin, vec2<f32>(0.0)));
++}
++
++fn inside_rect(point: vec2<f32>, rect: vec4<f32>) -> bool {
++    return all(point >= rect.xy) && all(point <= rect.zw);
++}
++
++// Never contains any point.
++const EMPTY_RECT: vec4<f32> = vec4<f32>(1.0, 1.0, 0.0, 0.0);
++
+ fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
+     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
+     let transformed = transpose(transform.rotation_scale) * position + transform.translation;
+@@ -536,15 +550,36 @@ struct QuadVarying {
+     @location(3) @interpolate(flat) background_solid: vec4<f32>,
+     @location(4) @interpolate(flat) background_color0: vec4<f32>,
+     @location(5) @interpolate(flat) background_color1: vec4<f32>,
++    // Pixels inside this rect (min.xy, max.xy) are plain solid background.
++    @location(6) @interpolate(flat) solid_interior: vec4<f32>,
+ }
+ 
+ @vertex
+ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> QuadVarying {
+     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+     let quad = load_quad(instance_id);
++    let geometry = clip_bounds_to_mask(quad.bounds, quad.content_mask);
+ 
+     var out = QuadVarying();
+-    out.position = to_device_position(unit_vertex, quad.bounds);
++    out.position = to_device_position(unit_vertex, geometry);
++
++    // Conservative subset of the fragment shader's background fast paths: away
++    // from every border and every corner radius by at least the AA threshold.
++    out.solid_interior = EMPTY_RECT;
++    if (quad.background.tag == 0u) {
++        let radii = quad.corner_radii;
++        let widths = quad.border_widths;
++        let radius = max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left));
++        if (radius == 0.0 && widths.top == 0.0 && widths.right == 0.0 &&
++                widths.bottom == 0.0 && widths.left == 0.0) {
++            out.solid_interior = vec4<f32>(quad.bounds.origin, quad.bounds.origin + quad.bounds.size);
++        } else {
++            let lead = vec2<f32>(max(widths.left, radius), max(widths.top, radius)) + 0.5;
++            let trail = vec2<f32>(max(widths.right, radius), max(widths.bottom, radius)) + 0.5;
++            out.solid_interior = vec4<f32>(quad.bounds.origin + lead,
++                quad.bounds.origin + quad.bounds.size - trail);
++        }
++    }
+ 
+     let gradient = prepare_gradient_color(
+         quad.background.tag,
+@@ -557,7 +592,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
+     out.background_color1 = gradient.color1;
+     out.border_color = hsla_to_rgba(quad.border_color);
+     out.quad_id = instance_id;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
++    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, quad.content_mask);
+     return out;
+ }
+ 
+@@ -568,6 +603,11 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+         return vec4<f32>(0.0);
+     }
+ 
++    // Plain background pixels don't need the quad record at all.
++    if (inside_rect(input.position.xy, input.solid_interior)) {
++        return blend_color(input.background_solid, 1.0);
++    }
++
+     let quad = load_quad(input.quad_id);
+ 
+     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+@@ -970,6 +1010,8 @@ struct ShadowVarying {
+     @location(1) @interpolate(flat) shadow_id: u32,
+     //TODO: use `clip_distance` once Naga supports it
+     @location(3) clip_distances: vec4<f32>,
++    // Pixels inside this rect (min.xy, max.xy) are fully shadowed.
++    @location(4) @interpolate(flat) opaque_interior: vec4<f32>,
+ }
+ 
+ @vertex
+@@ -987,12 +1029,24 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
+         geometry.origin -= vec2<f32>(margin);
+         geometry.size += 2.0 * vec2<f32>(margin);
+     }
++    geometry = clip_bounds_to_mask(geometry, shadow.content_mask);
+ 
+     var out = ShadowVarying();
+     out.position = to_device_position(unit_vertex, geometry);
+     out.color = hsla_to_rgba(shadow.color);
+     out.shadow_id = instance_id;
+     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
++
++    // Deeper than the gaussian tail plus the largest corner radius, a drop
++    // shadow's coverage is 1.
++    out.opaque_interior = EMPTY_RECT;
++    if (shadow.inset == 0u) {
++        let radii = shadow.corner_radii;
++        let radius = max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left));
++        let depth = 3.0 * shadow.blur_radius + radius + 0.5;
++        out.opaque_interior = vec4<f32>(shadow.bounds.origin + depth,
++            shadow.bounds.origin + shadow.bounds.size - depth);
++    }
+     return out;
+ }
+ 
+@@ -1003,6 +1057,10 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
+         return vec4<f32>(0.0);
+     }
+ 
++    if (inside_rect(input.position.xy, input.opaque_interior)) {
++        return blend_color(input.color, 1.0);
++    }
++
+     let shadow = load_shadow(input.shadow_id);
+     let half_size = shadow.bounds.size / 2.0;
+     let center = shadow.bounds.origin + half_size;

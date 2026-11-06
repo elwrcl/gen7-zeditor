@@ -1,0 +1,106 @@
+diff --git a/crates/gpui_linux/src/linux/wayland/window.rs b/crates/gpui_linux/src/linux/wayland/window.rs
+index 8d92234..2584a88 100644
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -549,6 +549,26 @@ pub struct WaylandWindowStatePtr {
+     frame_loop: Rc<Cell<FrameLoop>>,
+     frame_ping: Ping,
+     scheduled_frame_at: Rc<Cell<Option<Instant>>>,
++    /// A frame was started before the compositor's callback for the previous one.
++    frame_ahead: Rc<Cell<bool>>,
++    last_frame_callback_at: Rc<Cell<Option<Instant>>>,
++    previous_frame_callback_at: Rc<Cell<Option<Instant>>>,
++}
++
++/// Eager frames only while the compositor presents the window at display rate.
++/// Hidden windows (another workspace) still get occasional callbacks, and a
++/// swap issued then blocks the main thread until the next one arrives.
++const EAGER_FRAME_CALLBACK_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
++
++/// Start the next frame while the previous one is still on the GPU or with the
++/// compositor (disable with GEN7_ZEDITOR_EAGER_FRAMES=0). Waiting for the frame
++/// callback serializes CPU, GPU and composition, which on slow GPUs pushes most
++/// frames past one refresh interval.
++fn eager_frames() -> bool {
++    static EAGER_FRAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *EAGER_FRAMES.get_or_init(|| {
++        std::env::var("GEN7_ZEDITOR_EAGER_FRAMES").map_or(true, |value| value != "0")
++    })
+ }
+ 
+ impl WaylandWindowState {
+@@ -878,6 +898,9 @@ impl WaylandWindow {
+             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
+             frame_ping,
+             scheduled_frame_at: Rc::new(Cell::new(None)),
++            frame_ahead: Rc::new(Cell::new(false)),
++            last_frame_callback_at: Rc::new(Cell::new(None)),
++            previous_frame_callback_at: Rc::new(Cell::new(None)),
+         });
+ 
+         // Kick things off
+@@ -966,7 +989,8 @@ impl WaylandWindowStatePtr {
+         let mut state = self.state.borrow_mut();
+ 
+         let frame_loop = self.frame_loop.get();
+-        if frame_loop == FrameLoop::AwaitingCallback {
++        // Scheduled here means an eager frame was armed during this tick.
++        if frame_loop == FrameLoop::AwaitingCallback || frame_loop == FrameLoop::Scheduled {
+             return;
+         }
+ 
+@@ -1010,6 +1034,9 @@ impl WaylandWindowStatePtr {
+         // Another wl_surface commit may have carried this callback while a retry
+         // timer owned the render-loop wakeup.
+         self.state.borrow_mut().pending_frame_callback = None;
++        self.frame_ahead.set(false);
++        self.previous_frame_callback_at
++            .set(self.last_frame_callback_at.replace(Some(Instant::now())));
+         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+             self.frame(signal_at, FrameRequestSource::NativeCallback);
+         }
+@@ -1045,6 +1072,18 @@ impl WaylandWindowStatePtr {
+                     .set(PlatformFrameSignal::capture(Instant::now));
+                 self.frame_ping.ping();
+             }
++            // At most one frame ahead of the compositor: with FIFO presentation
++            // the next swap then blocks until the previous frame was shown, so
++            // frames stay paced to the display.
++            FrameLoop::AwaitingCallback
++                if eager_frames() && !self.frame_ahead.get() && self.compositor_is_presenting() =>
++            {
++                self.frame_ahead.set(true);
++                self.frame_loop.set(FrameLoop::Scheduled);
++                self.scheduled_frame_at
++                    .set(PlatformFrameSignal::capture(Instant::now));
++                self.frame_ping.ping();
++            }
+             FrameLoop::Ticking => {
+                 self.frame_loop.set(FrameLoop::RescheduleRequested);
+             }
+@@ -1054,6 +1093,25 @@ impl WaylandWindowStatePtr {
+         }
+     }
+ 
++    fn compositor_is_presenting(&self) -> bool {
++        let recent_callback = match (
++            self.previous_frame_callback_at.get(),
++            self.last_frame_callback_at.get(),
++        ) {
++            (Some(previous), Some(last)) => {
++                last.elapsed() < EAGER_FRAME_CALLBACK_WINDOW
++                    && last.duration_since(previous) < EAGER_FRAME_CALLBACK_WINDOW
++            }
++            _ => false,
++        };
++        // A borrowed state means we're inside a state update; skip eagerness then.
++        let visible = self
++            .state
++            .try_borrow()
++            .is_ok_and(|state| state.visibility == WindowVisibility::Visible);
++        recent_callback && visible
++    }
++
+     fn request_redraw(&self) {
+         self.state.borrow_mut().redraw_requested = true;
+         self.schedule_frame();
