@@ -13,6 +13,7 @@ zed=$(cd "${1:?usage: $0 path/to/zed}" && pwd)
 declare -A patch_files=(
   [0001-gpui_wgpu-skip-redundant-fragment-work]="crates/gpui_wgpu/src/shaders.wgsl"
   [0002-gpui_linux-start-frames-before-the-compositor-callback]="crates/gpui_linux/src/linux/wayland/window.rs"
+  [0003-gpui_wgpu-read-wgpu-instance-flags-from-the-environment]="crates/gpui_wgpu/src/wgpu_context.rs"
 )
 
 for name in "${!patch_files[@]}"; do

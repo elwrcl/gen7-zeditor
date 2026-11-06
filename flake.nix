@@ -24,6 +24,7 @@
       patches = [
         ./patches/0001-gpui_wgpu-skip-redundant-fragment-work.patch
         ./patches/0002-gpui_linux-start-frames-before-the-compositor-callback.patch
+        ./patches/0003-gpui_wgpu-read-wgpu-instance-flags-from-the-environment.patch
       ];
 
       patchZed =

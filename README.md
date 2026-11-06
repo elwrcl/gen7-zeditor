@@ -10,18 +10,21 @@ applied. CI builds every change and pushes it to the
 [`zeditor`](https://zeditor.cachix.org) Cachix cache, so consumers download the
 result instead of compiling Zed.
 
+The investigation, the patches and this repository were written by Claude, an AI
+model by Anthropic; see [How this was made](#how-this-was-made).
+
 ## Why stock Zed is slow on old GPUs
 
 Zed's renderer (GPUI on wgpu) redraws the whole window every frame. Profiling
 with apitrace on the HD 4000 at 1920×1060 showed ~52 ms of GPU time per frame:
 
-| Work per frame | GPU time | Cause |
-|---|---|---|
-| Window drop shadow | ~16 ms | blur shader evaluated for every pixel of the window, interior included |
-| Overlapping background quads | ~15 ms | every pixel loads its quad record from a storage buffer |
-| Bordered and rounded quads | ~14 ms | same, plus the SDF math |
-| Quads outside their clip rect | ~6 ms | rasterized in full, discarded in the fragment shader |
-| Text | 0.06 ms | |
+| Work per frame                | GPU time | Cause                                                                  |
+| ----------------------------- | -------- | ---------------------------------------------------------------------- |
+| Window drop shadow            | ~16 ms   | blur shader evaluated for every pixel of the window, interior included |
+| Overlapping background quads  | ~15 ms   | every pixel loads its quad record from a storage buffer                |
+| Bordered and rounded quads    | ~14 ms   | same, plus the SDF math                                                |
+| Quads outside their clip rect | ~6 ms    | rasterized in full, discarded in the fragment shader                   |
+| Text                          | 0.06 ms  |                                                                        |
 
 That is ~12 fragment shader invocations per pixel. A modern GPU does this in a
 millisecond; the HD 4000's 16 EUs need 50. The cost scales with window area,
@@ -47,23 +50,32 @@ miss the 16.7 ms refresh interval.
 
 - **`0002-gpui_linux-start-frames-before-the-compositor-callback`** (Wayland):
   when a redraw is requested while the last frame's callback is still pending,
-  the next frame starts right away, at most one frame ahead. FIFO presentation
-  still paces frames to the display (the next swap waits for the previous frame
-  to be shown). It only kicks in while the compositor delivers callbacks at
-  display rate, so windows on hidden workspaces, which still get the occasional
-  callback, never block in a swap. Set `GEN7_ZEDITOR_EAGER_FRAMES=0` to turn it
-  off.
+  the next frame starts right away, at most one frame ahead. On OpenGL, which
+  only has FIFO presentation, the next swap waits for the previous frame to be
+  shown, so frames stay paced to the display. On Vulkan, Zed asks for Mailbox
+  (upstream's choice), which never waits: while you scroll or type, up to two
+  frames per refresh are drawn and the compositor shows the newest. It only
+  kicks in while the compositor delivers callbacks at display rate, so windows
+  on hidden workspaces, which still get the occasional callback, never block in
+  a swap. Set `GEN7_ZEDITOR_EAGER_FRAMES=0` to turn it off.
+
+- **`0003-gpui_wgpu-read-wgpu-instance-flags-from-the-environment`**: Zed
+  creates its wgpu instance with fixed flags, so wgpu's environment variables
+  are ignored and Vulkan drivers that report no conformance version (hasvk on
+  Ivy Bridge) stay hidden; Zed then runs on OpenGL. With this patch
+  `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=1` exposes such a driver and Zed
+  prefers it. Without the variable nothing changes.
 
 ### Measurements
 
 HD 4000, niri, tiled full-width window on a 1920×1080 monitor, 2923-line Rust
 file, OpenGL backend:
 
-| Scenario | Stock Zed 1.25.3 | Patched |
-|---|---|---|
-| Holding an arrow key (35 repeats/s), frames drawn/s | 13.3 | 58.7 |
-| Wheel scrolling, frames drawn/s | 13.3 | 48.2 |
-| Wheel scrolling, laptop panel (1366×768) | – | 59.1 |
+| Scenario                                            | Stock Zed 1.25.3 | Patched |
+| --------------------------------------------------- | ---------------- | ------- |
+| Holding an arrow key (35 repeats/s), frames drawn/s | 13.3             | 58.7    |
+| Wheel scrolling, frames drawn/s                     | 13.3             | 48.2    |
+| Wheel scrolling, laptop panel (1366×768)            | –                | 59.1    |
 
 ## Using it
 
@@ -112,6 +124,12 @@ nix run github:elwrcl/gen7-zeditor
 - On a tiling compositor that does not tell windows they are tiled (niri without
   `prefer-no-csd`, for example), Zed draws its own window shadow on every frame.
   `"window_decorations": "server"` in Zed's settings avoids that.
+- On Ivy Bridge, `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=1` (patch 0003)
+  switches Zed to hasvk. Throughput is the same as OpenGL when both are paced
+  to the display; Mailbox mainly helps heavy scenes such as scrolling with
+  many search highlights (44 → 55 frames/s in the benchmark), at the cost of
+  extra GPU work while scrolling. Check which backend is used with
+  `grep 'Selected GPU adapter' ~/.local/share/zed/logs/Zed.log`.
 
 ## Updates
 
@@ -136,6 +154,19 @@ The first build takes as long as a full build; after that, a change to
 `gpui_linux` or `gpui_wgpu` rebuilds in about six minutes on an i5-3210M
 (`release-fast` profile: no LTO, 16 codegen units). Edit `../zed-work/zed`, then
 regenerate the patches with `scripts/update-patches.sh ../zed-work/zed`.
+
+## How this was made
+
+This repository is the result of a debugging session in
+[Claude Code](https://claude.com/claude-code) with Claude Opus 5.5:
+
+- **Claude** profiled stock Zed on the HD 4000 (Gallium HUD counters, apitrace
+  GPU timing per draw call, Mesa shader statistics, perf), found the causes
+  described above, wrote both patches, verified them with pixel-diffed
+  screenshots and repeatable benchmarks, and wrote the flake, scripts, CI
+  workflows and this README.
+
+Review the patches as you would any third-party change before relying on them.
 
 ## License
 
